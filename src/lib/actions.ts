@@ -1,52 +1,183 @@
 "use server"
 
 import { v4 as uuidv4 } from "uuid"
-import { db, type Player, type Group, type Match, type Score, DB } from "@/lib/db"
 import { revalidatePath } from "next/cache"
-import { neon } from "@neondatabase/serverless";
+import { neon, NeonQueryInTransaction, type NeonQueryFunction } from "@neondatabase/serverless"
+import type { Player, Group, Match, Score, DB } from "@/lib/db"
 
-export async function getData(): Promise<DB> {
-    const sql = neon(process.env.DATABASE_URL || '');
-    const data = {
-        players: await sql`SELECT * FROM players`,
-        groups: await sql`SELECT * FROM groups`,
-        playerGroups: await sql`SELECT * FROM player_groups`,
-        matches: await sql`SELECT * FROM matches`,
-        scores: await sql`SELECT * FROM scores`,
-    };
-    return data as DB;
+// Initialize database connection
+let sql: NeonQueryFunction<any, any> | null = null
+let cachedData: DB | null = null
+
+// Function to get SQL client
+function getSqlClient() {
+  if (!sql) {
+    if (!process.env.DATABASE_URL) {
+      throw new Error("DATABASE_URL environment variable is not set")
+    }
+    sql = neon(process.env.DATABASE_URL)
+  }
+  return sql
 }
 
-const data = getData()
+// Initialize database tables if they don't exist
+export async function initializeDatabase() {
+  const sql = getSqlClient()
+
+  // Create tables if they don't exist
+  await sql`
+    CREATE TABLE IF NOT EXISTS players (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS groups (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS player_groups (
+      "playerId" TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+      "groupId" TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      PRIMARY KEY ("playerId", "groupId")
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS matches (
+      id TEXT PRIMARY KEY,
+      "player1Id" TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+      "player2Id" TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+      "groupId" TEXT REFERENCES groups(id) ON DELETE CASCADE,
+      round INTEGER NOT NULL,
+      "scheduledTime" TIMESTAMP,
+      completed BOOLEAN NOT NULL DEFAULT FALSE,
+      "isPlayoff" BOOLEAN NOT NULL DEFAULT FALSE
+    )
+  `
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS scores (
+      "matchId" TEXT PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
+      "player1Score" INTEGER NOT NULL,
+      "player2Score" INTEGER NOT NULL,
+      "winnerId" TEXT REFERENCES players(id) ON DELETE SET NULL
+    )
+  `
+}
+
+// Function to get all data from database
+export async function getData(): Promise<DB> {
+  if (cachedData) {
+    return cachedData
+  }
+
+  const sql = getSqlClient()
+
+  try {
+    // Ensure tables exist
+    await initializeDatabase()
+
+    // Fetch all data
+    const [players, groups, playerGroups, matches, scores] = await Promise.all([
+      sql`SELECT * FROM players`,
+      sql`SELECT * FROM groups`,
+      sql`SELECT * FROM player_groups`,
+      sql`SELECT * FROM matches`,
+      sql`SELECT * FROM scores`,
+    ])
+
+    // Convert date strings to Date objects
+    const processedPlayers = (players as Record<string, any>[]).map((player: any) => ({
+      ...player,
+      createdAt: new Date(player.createdAt),
+    }))
+
+    const processedGroups = (groups as Record<string, any>[]).map((group: any) => ({
+      ...group,
+      createdAt: new Date(group.createdAt),
+    }))
+
+    const processedMatches = Array.isArray(matches)
+      ? matches.map((match: any) => ({
+          ...match,
+          scheduledTime: match.scheduledTime ? new Date(match.scheduledTime) : null,
+        }))
+      : []
+
+      const processedPlayerGroups = (playerGroups as Record<string, any>[]).map((playerGroup: any) => ({
+        playerId: playerGroup.playerId,
+        groupId: playerGroup.groupId,
+      }))
+
+      const processedScores = (scores as Record<string, any>[]).map((score: any) => ({
+        matchId: score.matchId,
+        player1Score: score.player1Score,
+        player2Score: score.player2Score,
+        winnerId: score.winnerId,
+      }))
+
+    cachedData = {
+      players: processedPlayers,
+      groups: processedGroups,
+      playerGroups: processedPlayerGroups,
+      matches: processedMatches,
+      scores: processedScores,
+    }
+
+    return cachedData
+  } catch (error) {
+    console.error("Error fetching data from database:", error)
+    throw error
+  }
+}
+
+// Function to invalidate cache
+function invalidateCache() {
+  cachedData = null
+}
 
 // Player actions
 export async function getPlayers(): Promise<Player[]> {
-  const resolvedData = await data;
-  return resolvedData.players;
+  const data = await getData()
+  return data.players
 }
 
-export async function addPlayer(data: { name: string; email: string }): Promise<Player> {
-  const newPlayer: Player = {
-    id: uuidv4(),
-    name: data.name,
-    email: data.email,
-    createdAt: new Date(),
-  }
+export async function addPlayer(playerData: { name: string; email: string }): Promise<Player> {
+  const sql = getSqlClient()
+  const now = new Date()
 
-  data.players.push(newPlayer)
+  await sql`
+    INSERT INTO players (name, email, "createdAt")
+    VALUES (${playerData.name}, ${playerData.email}, ${now})
+  `
+
+  invalidateCache()
   revalidatePath("/players")
-  return newPlayer
+
+  return {
+    id: uuidv4(),
+    name: playerData.name,
+    email: playerData.email,
+    createdAt: now,
+  }
 }
 
 export async function removePlayer(id: string): Promise<void> {
-  data.players = data.players.filter((player) => player.id !== id)
+  const sql = getSqlClient()
 
-  // Also remove player from groups
-  data.playerGroups = data.playerGroups.filter((pg) => pg.playerId !== id)
+  // The foreign key constraints with ON DELETE CASCADE will handle
+  // removing related records in player_groups, matches, and scores
+  await sql`DELETE FROM players WHERE id = ${id}`
 
-  // Remove matches involving this player
-  data.matches = data.matches.filter((match) => match.player1Id !== id && match.player2Id !== id)
-
+  invalidateCache()
   revalidatePath("/players")
   revalidatePath("/groups")
   revalidatePath("/schedule")
@@ -56,96 +187,138 @@ export async function removePlayer(id: string): Promise<void> {
 
 // Group actions
 export async function getGroups(): Promise<Group[]> {
+  const data = await getData()
   return data.groups
 }
 
 export async function getGroupPlayers(groupId: string): Promise<Player[]> {
-  const playerIds = data.playerGroups.filter((pg) => pg.groupId === groupId).map((pg) => pg.playerId)
+  const sql = getSqlClient()
 
-  return data.players.filter((player) => playerIds.includes(player.id))
+  const players = await sql`
+    SELECT p.* FROM players p
+    JOIN player_groups pg ON p.id = pg."playerId"
+    WHERE pg."groupId" = ${groupId}
+  `
+
+  if (Array.isArray(players)) {
+    return players.map((player: any) => ({
+      ...player,
+      createdAt: new Date(player.createdAt),
+    }))
+  }
+  throw new Error("Unexpected data format for players")
 }
 
 export async function createRandomGroups(numGroups: number): Promise<void> {
-  // Clear existing groups
-  data.groups = []
-  data.playerGroups = []
+  const sql = getSqlClient()
+  const data = await getData()
 
-  // Create new groups
-  for (let i = 1; i <= numGroups; i++) {
-    const newGroup: Group = {
-      id: uuidv4(),
-      name: `Group ${i}`,
-      createdAt: new Date(),
+  // Start a transaction
+  const tx = sql.transaction((tx) => {
+    const queries: NeonQueryInTransaction[] = []
+
+    // Delete existing groups and player_groups
+    queries.push(tx`DELETE FROM player_groups`)
+    queries.push(tx`DELETE FROM groups`)
+
+    // Create new groups
+    const groups: Group[] = []
+    for (let i = 1; i <= numGroups; i++) {
+      const id: string = uuidv4()
+      const name: string = `Group ${i}`
+      const now: Date = new Date()
+
+      queries.push(tx`
+        INSERT INTO groups (id, name, "createdAt")
+        VALUES (${id}, ${name}, ${now})
+      `)
+
+      groups.push({ id, name, createdAt: now })
     }
-    data.groups.push(newGroup)
-  }
 
-  // Shuffle players and assign to groups
-  const shuffledPlayers = [...data.players].sort(() => Math.random() - 0.5)
+    // Shuffle players and assign to groups
+    const shuffledPlayers = [...data.players].sort(() => Math.random() - 0.5)
 
-  shuffledPlayers.forEach((player, index) => {
-    const groupIndex = index % numGroups
-    const groupId = data.groups[groupIndex].id
+    for (let i = 0; i < shuffledPlayers.length; i++) {
+      const groupIndex = i % numGroups
+      const groupId = groups[groupIndex].id
+      const playerId = shuffledPlayers[i].id
 
-    data.playerGroups.push({
-      playerId: player.id,
-      groupId: groupId,
-    })
+      queries.push(tx`
+        INSERT INTO player_groups ("playerId", "groupId")
+        VALUES (${playerId}, ${groupId})
+      `)
+    }
+
+    return queries
   })
 
-  revalidatePath("/groups")
-}
+      invalidateCache()
+      revalidatePath("/groups")
+  }
 
 // Match actions
 export async function generateGroupMatches(): Promise<void> {
-  // Clear existing group matches
-  data.matches = data.matches.filter((match) => match.isPlayoff)
-  data.scores = data.scores.filter((score) => {
-    const match = data.matches.find((m) => m.id === score.matchId)
-    return match && match.isPlayoff
+  const sql = getSqlClient()
+  const data = await getData()
+
+  // Start a transaction
+  sql.transaction((tx) => {
+    const queries: NeonQueryInTransaction[] = []
+
+    // Delete existing non-playoff matches and their scores
+    queries.push(tx`
+      DELETE FROM scores
+      WHERE "matchId" IN (
+        SELECT id FROM matches WHERE "isPlayoff" = false
+      )
+    `)
+    queries.push(tx`DELETE FROM matches WHERE "isPlayoff" = false`)
+
+    // Generate round-robin matches for each group
+    data.groups.forEach((group) => {
+      const players = getGroupPlayers(group.id)
+
+      players.then((resolvedPlayers) => {
+        for (let i = 0; i < resolvedPlayers.length; i++) {
+          for (let j = i + 1; j < resolvedPlayers.length; j++) {
+            const id = uuidv4()
+
+            queries.push(tx`
+              INSERT INTO matches (id, "player1Id", "player2Id", "groupId", round, completed, "isPlayoff")
+              VALUES (${id}, ${resolvedPlayers[i].id}, ${resolvedPlayers[j].id}, ${group.id}, 1, false, false)
+            `)
+          }
+        }
+      })
+    })
+
+    return queries
   })
 
-  // Generate round-robin matches for each group
-  for (const group of data.groups) {
-    const players = await getGroupPlayers(group.id)
-
-    // Generate all possible pairs of players
-    for (let i = 0; i < players.length; i++) {
-      for (let j = i + 1; j < players.length; j++) {
-        const newMatch: Match = {
-          id: uuidv4(),
-          player1Id: players[i].id,
-          player2Id: players[j].id,
-          groupId: group.id,
-          round: 1, // All group matches are round 1
-          scheduledTime: null,
-          completed: false,
-          isPlayoff: false,
-        }
-
-        data.matches.push(newMatch)
-      }
-    }
-  }
-
+  invalidateCache()
   revalidatePath("/schedule")
   revalidatePath("/matches")
 }
 
 export async function getMatches(): Promise<Match[]> {
+  const data = await getData()
   return data.matches
 }
 
 export async function getMatchById(id: string): Promise<Match | undefined> {
+  const data = await getData()
   return data.matches.find((match) => match.id === id)
 }
 
 export async function getMatchScore(matchId: string): Promise<Score | undefined> {
+  const data = await getData()
   return data.scores.find((score) => score.matchId === matchId)
 }
 
 export async function recordMatchScore(matchId: string, player1Score: number, player2Score: number): Promise<void> {
-  const match = data.matches.find((m) => m.id === matchId)
+  const sql = getSqlClient()
+  const match = await getMatchById(matchId)
 
   if (!match) {
     throw new Error("Match not found")
@@ -159,43 +332,55 @@ export async function recordMatchScore(matchId: string, player1Score: number, pl
     winnerId = match.player2Id
   }
 
-  // Check if score already exists
-  const existingScoreIndex = data.scores.findIndex((s) => s.matchId === matchId)
+  // Start a transaction
+  await sql.transaction((tx) => {
+    const queries: NeonQueryInTransaction[] = []
 
-  if (existingScoreIndex >= 0) {
-    // Update existing score
-    data.scores[existingScoreIndex] = {
-      matchId,
-      player1Score,
-      player2Score,
-      winnerId,
-    }
-  } else {
-    // Create new score
-    data.scores.push({
-      matchId,
-      player1Score,
-      player2Score,
-      winnerId,
-    })
-  }
+    queries.push(
+      tx`
+        DELETE FROM scores WHERE "matchId" = ${matchId}
+      `
+    )
 
-  // Mark match as completed
-  const matchIndex = data.matches.findIndex((m) => m.id === matchId)
-  if (matchIndex >= 0) {
-    data.matches[matchIndex].completed = true
-  }
+    queries.push(
+      tx`
+        INSERT INTO scores ("matchId", "player1Score", "player2Score", "winnerId")
+        VALUES (${matchId}, ${player1Score}, ${player2Score}, ${winnerId})
+      `
+    )
 
+    queries.push(
+      tx`
+        UPDATE matches
+        SET completed = true
+        WHERE id = ${matchId}
+      `
+    )
+
+    return queries
+  })
+
+  invalidateCache()
   revalidatePath("/matches")
   revalidatePath("/standings")
 }
 
 // Standings actions
 export async function getGroupStandings(groupId: string): Promise<any[]> {
-  const players = await getGroupPlayers(groupId)
-  const groupMatches = data.matches.filter((match) => match.groupId === groupId)
+  const sql = getSqlClient()
 
-  const standings = players.map((player) => {
+  // Get all players in the group
+  const players = await getGroupPlayers(groupId)
+
+  // Get all matches for the group
+  const matches = await sql`
+    SELECT m.*, s."player1Score", s."player2Score", s."winnerId"
+    FROM matches m
+    LEFT JOIN scores s ON m.id = s."matchId"
+    WHERE m."groupId" = ${groupId}
+  `
+
+  const standings: any[] = players.map((player: Player) => {
     // Initialize player stats
     const stats = {
       player,
@@ -205,32 +390,31 @@ export async function getGroupStandings(groupId: string): Promise<any[]> {
       points: 0,
     }
 
-    // Calculate stats from completed matches
-    groupMatches.forEach((match) => {
-      const score = data.scores.find((s) => s.matchId === match.id)
+    if (Array.isArray(matches)) {
+      matches.forEach((match: any) => {
+        if (match.completed) {
+          if (match.player1Id === player.id || match.player2Id === player.id) {
+            stats.played++
 
-      if (score && match.completed) {
-        if (match.player1Id === player.id || match.player2Id === player.id) {
-          stats.played++
-
-          if (score.winnerId === player.id) {
-            stats.won++
-            stats.points += 2 // 2 points for a win
-          } else if (score.winnerId !== null) {
-            stats.lost++
-            stats.points += 0 // 0 points for a loss
-          } else {
-            stats.points += 1 // 1 point for a draw
+            if (match.winnerId === player.id) {
+              stats.won++
+              stats.points += 2 // 2 points for a win
+            } else if (match.winnerId !== null) {
+              stats.lost++
+              stats.points += 0 // 0 points for a loss
+            } else {
+              stats.points += 1 // 1 point for a draw
+            }
           }
         }
-      }
-    })
+      })
+    }
 
     return stats
   })
 
   // Sort by points (descending), then by wins (descending)
-  return standings.sort((a, b) => {
+  return standings.sort((a: { points: number; won: number }, b: { points: number; won: number }) => {
     if (b.points !== a.points) {
       return b.points - a.points
     }
@@ -240,49 +424,58 @@ export async function getGroupStandings(groupId: string): Promise<any[]> {
 
 // Playoff actions
 export async function generatePlayoffs(): Promise<void> {
-  // Clear existing playoff matches
-  data.matches = data.matches.filter((match) => !match.isPlayoff)
-  data.scores = data.scores.filter((score) => {
-    const match = data.matches.find((m) => m.id === score.matchId)
-    return match && !match.isPlayoff
+  const sql = getSqlClient()
+
+  // Start a transaction
+  await sql.transaction((tx) => {
+    const queries: NeonQueryInTransaction[] = []
+
+    // Delete existing playoff matches and their scores
+    queries.push(tx`
+      DELETE FROM scores
+      WHERE "matchId" IN (
+        SELECT id FROM matches WHERE "isPlayoff" = true
+      )
+    `)
+    queries.push(tx`DELETE FROM matches WHERE "isPlayoff" = true`)
+
+    // Get all groups
+    const groups = getGroups()
+
+    // Get top 2 players from each group
+    const playoffPlayers: Player[] = []
+
+    groups.then((groupList) => {
+      groupList.forEach(async (group) => {
+        const standings = await getGroupStandings(group.id)
+        const topTwo = standings.slice(0, 2).map((s) => s.player)
+        playoffPlayers.push(...topTwo)
+      })
+    })
+
+    // Shuffle players to create random matchups
+    const shuffledPlayers = [...playoffPlayers].sort(() => Math.random() - 0.5)
+
+    // Create first round matches
+    for (let i = 0; i < shuffledPlayers.length; i += 2) {
+      if (i + 1 < shuffledPlayers.length) {
+        const id = uuidv4()
+
+        queries.push(tx`
+          INSERT INTO matches (id, "player1Id", "player2Id", "groupId", round, completed, "isPlayoff")
+          VALUES (${id}, ${shuffledPlayers[i].id}, ${shuffledPlayers[i + 1].id}, NULL, 1, false, true)
+        `)
+      }
+    }
+
+    return queries
   })
 
-  // Get top 2 players from each group
-  const playoffPlayers: Player[] = []
-
-  for (const group of data.groups) {
-    const standings = await getGroupStandings(group.id)
-    const topTwo = standings.slice(0, 2).map((s) => s.player)
-    playoffPlayers.push(...topTwo)
-  }
-
-  // Generate playoff matches (single elimination)
-  // This is a simplified version - in a real app, you'd want to seed the bracket
-
-  // Shuffle players to create random matchups
-  const shuffledPlayers = [...playoffPlayers].sort(() => Math.random() - 0.5)
-
-  // Create first round matches
-  for (let i = 0; i < shuffledPlayers.length; i += 2) {
-    if (i + 1 < shuffledPlayers.length) {
-      const newMatch: Match = {
-        id: uuidv4(),
-        player1Id: shuffledPlayers[i].id,
-        player2Id: shuffledPlayers[i + 1].id,
-        groupId: null, // Playoff matches don't belong to a group
-        round: 1,
-        scheduledTime: null,
-        completed: false,
-        isPlayoff: true,
-      }
-
-      data.matches.push(newMatch)
-    }
-  }
-
+  invalidateCache()
   revalidatePath("/playoffs")
 }
 
 export async function getPlayoffMatches(): Promise<Match[]> {
+  const data = await getData()
   return data.matches.filter((match) => match.isPlayoff)
 }
